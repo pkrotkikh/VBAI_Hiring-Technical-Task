@@ -1,4 +1,4 @@
-Hello! If you want to quickly see the final result - watch the attached video.
+Hello! If you want to quickly see the final result - watch the attached video: 0Watch_Result.mp4.
 If you want to try the system yourself - read on!
 
 # Venture Builder AI
