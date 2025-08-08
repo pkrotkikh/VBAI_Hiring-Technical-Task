@@ -1,0 +1,1064 @@
+import websockets
+import asyncio
+import json
+import pyaudio
+import wave
+import sounddevice as sd
+import audioop
+import numpy as np
+from threading import Thread, Event
+import queue
+from pydub import AudioSegment
+
+# Adventure Game
+import time
+from dotenv import load_dotenv
+from openai import OpenAI
+import textwrap
+import sys
+import numpy as np
+import math
+from OpenGL.GLU import *
+from OpenGL.GL import *
+from pygame.locals import *
+import pygame
+import os
+from concurrent.futures import ThreadPoolExecutor
+import io
+os.environ['SDL_VIDEODRIVER'] = 'cocoa'
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+
+# Load environment variables
+load_dotenv()
+api_key = os.getenv('OPENAI_API_KEY')
+if not api_key:
+    print("[OpenAI] API key not found. Please set OPENAI_API_KEY in your .env file.")
+    sys.exit(1)
+client = OpenAI()
+print("[OpenAI] API key loaded successfully.")
+
+# Initialize Pygame with macOS specific settings
+pygame.init()
+display = (800, 600)
+pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
+pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
+pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
+screen = pygame.display.get_surface()
+
+# Set up the camera and perspective
+glEnable(GL_DEPTH_TEST)
+glMatrixMode(GL_PROJECTION)
+glLoadIdentity()
+gluPerspective(45, (display[0]/display[1]), 0.1, 50.0)
+glMatrixMode(GL_MODELVIEW)
+
+# Set up basic lighting
+glEnable(GL_LIGHTING)
+glEnable(GL_LIGHT0)
+glLightfv(GL_LIGHT0, GL_POSITION, [0, 5, 5, 1])
+glLightfv(GL_LIGHT0, GL_AMBIENT, [0.5, 0.5, 0.5, 1])
+glLightfv(GL_LIGHT0, GL_DIFFUSE, [1.0, 1.0, 1.0, 1])
+
+# Enable blending for transparency
+glEnable(GL_BLEND)
+glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+# Initial camera position
+glTranslatef(0.0, 0.0, -5)
+
+# Constants
+WINDOW_WIDTH = 800
+WINDOW_HEIGHT = 600
+TILE_SIZE = 32
+FPS = 60
+
+# Colors
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+BLUE = (0, 0, 255)
+GREEN = (0, 255, 0)
+BROWN = (139, 69, 19)
+RED = (255, 0, 0)
+GRAY = (128, 128, 128)
+
+# Game map
+GAME_MAP = [
+    "WWWWWWWWWWWWWWWWWWWW",
+    "W..................W",
+    "W..................W",
+    "W........N.........W",
+    "W..................W",
+    "W..................W",
+    "W..................W",
+    "W....P.............W",
+    "W..................W",
+    "W..................W",
+    "W..................W",
+    "W..................W",
+    "WWWWWWWWWWWWWWWWWWWW"
+]
+
+TITLE = "Venture Builder AI"
+SUBTITLE = "Our Digital Employees"
+MENU_BG_COLOR = (0, 0, 0)
+MENU_TEXT_COLOR = (0, 255, 0)
+MENU_HIGHLIGHT_COLOR = (0, 200, 0)
+
+def draw_cube():
+    vertices = [
+        [-0.5, -0.5,  0.5], [0.5, -0.5,  0.5], [0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],
+        [-0.5, -0.5, -0.5], [-0.5,  0.5, -0.5], [0.5,  0.5, -0.5], [0.5, -0.5, -0.5],
+    ]
+    surfaces = [
+        [0, 1, 2, 3], [3, 2, 6, 5], [0, 3, 5, 4], [1, 7, 6, 2], [4, 5, 6, 7], [0, 4, 7, 1]
+    ]
+    glBegin(GL_QUADS)
+    for surface in surfaces:
+        glNormal3f(0, 0, 1)
+        for vertex in surface:
+            glVertex3fv(vertices[vertex])
+    glEnd()
+
+
+
+def draw_sphere(radius, slices, stacks):
+    for i in range(stacks):
+        lat0 = math.pi * (-0.5 + float(i) / stacks)
+        z0 = math.sin(lat0)
+        zr0 = math.cos(lat0)
+        lat1 = math.pi * (-0.5 + float(i + 1) / stacks)
+        z1 = math.sin(lat1)
+        zr1 = math.cos(lat1)
+        glBegin(GL_QUAD_STRIP)
+        for j in range(slices + 1):
+            lng = 2 * math.pi * float(j) / slices
+            x = math.cos(lng)
+            y = math.sin(lng)
+            glNormal3f(x * zr0, y * zr0, z0)
+            glVertex3f(x * zr0 * radius, y * zr0 * radius, z0 * radius)
+            glNormal3f(x * zr1, y * zr1, z1)
+            glVertex3f(x * zr1 * radius, y * zr1 * radius, z1 * radius)
+        glEnd()
+
+
+
+def shutdown():
+    if hasattr(game.dialogue, 'speech_handler'):
+        game.dialogue.speech_handler.cleanup()
+    pygame.quit()
+
+
+class SpeechHandler:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.client = OpenAI(api_key=api_key)
+        self.format = pyaudio.paInt16
+        self.channels = 1
+        self.rate = 48000  # Увеличено до 48000 для более чистого звука
+        self.chunk = 1024
+        self.recording = False
+        self.audio_queue = queue.Queue()  # Очередь для транскрипций
+        self.speech_playback_queue = queue.Queue()  # Очередь для воспроизведения
+        self.silence_threshold = 200
+        self.silence_count = 0
+        self.silence_limit = 5
+        self.stop_recording = Event()
+        self.recording_thread = None
+        self.playback_thread = None
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.audio = pyaudio.PyAudio()
+        self.output_stream = None
+        self.is_playing = False
+        self.stop_playing = Event()
+        print("[SpeechHandler] Initialized")
+
+    def start_listening(self):
+        if self.recording:
+            print("[SpeechHandler] Already recording")
+            return
+        self.recording = True
+        self.stop_recording.clear()
+        self.recording_thread = Thread(target=self._record_audio)
+        self.recording_thread.daemon = True
+        self.recording_thread.start()
+        print("[SpeechHandler] Started listening for speech")
+
+    def stop_listening(self):
+        if not self.recording:
+            print("[SpeechHandler] Not recording")
+            return
+        self.stop_recording.set()
+        if self.recording_thread:
+            self.recording_thread.join(timeout=1)
+        self.recording = False
+        if hasattr(self, 'last_frames') and self.last_frames:
+            print("[SpeechHandler] Processing remaining audio on stop")
+            self.executor.submit(self._process_speech, b''.join(self.last_frames))
+        print("[SpeechHandler] Stopped listening for speech")
+
+    def interrupt(self):
+        if self.is_playing:
+            self.stop_playing.set()
+            if self.output_stream:
+                self.output_stream.stop_stream()
+                self.output_stream.close()
+                self.output_stream = None
+            print("[SpeechHandler] Audio playback interrupted")
+            self.is_playing = False
+            with self.speech_playback_queue.mutex:
+                self.speech_playback_queue.queue.clear()
+
+    def _record_audio(self):
+        stream = self.audio.open(
+            format=self.format,
+            channels=self.channels,
+            rate=self.rate,
+            input=True,
+            frames_per_buffer=self.chunk
+        )
+        frames = []
+        silent = True
+        print("[SpeechHandler] Recording audio...")
+        try:
+            while not self.stop_recording.is_set():
+                data = stream.read(self.chunk, exception_on_overflow=False)
+                frames.append(data)
+                rms = audioop.rms(data, 2)
+                print(f"[SpeechHandler] Mic RMS: {rms}")
+                if rms > self.silence_threshold:
+                    silent = False
+                    self.silence_count = 0
+                    print(f"[SpeechHandler] Speech detected, RMS: {rms}")
+                elif not silent:
+                    self.silence_count += 1
+                    if self.silence_count > self.silence_limit:
+                        if len(frames) > 5:
+                            print("[SpeechHandler] Processing speech chunk")
+                            self.executor.submit(self._process_speech, b''.join(frames))
+                        frames = []
+                        silent = True
+                        self.silence_count = 0
+            self.last_frames = frames if frames else []
+        except Exception as e:
+            print(f"[SpeechHandler] Recording error: {e}")
+        finally:
+            stream.stop_stream()
+            stream.close()
+            print("[SpeechHandler] Recording stream closed")
+
+    async def _process_speech_async(self, audio_data):
+        try:
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wf:
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(self.audio.get_sample_size(self.format))
+                wf.setframerate(self.rate)
+                wf.writeframes(audio_data)
+            wav_buffer.seek(0)
+            transcript = self.client.audio.transcriptions.create(
+                model="whisper-1",
+                file=("audio.wav", wav_buffer, "audio/wav"),
+                language="en"
+            ).text
+            print(f"[SpeechHandler] Transcription result: {transcript}")
+            return transcript
+        except Exception as e:
+            print(f"[SpeechHandler] Speech processing error: {e}")
+            return ""
+
+    def _process_speech(self, audio_data):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        transcript = loop.run_until_complete(self._process_speech_async(audio_data))
+        loop.close()
+        if transcript:
+            print(f"[SpeechHandler] Adding to queue: {transcript}")
+            self.audio_queue.put(transcript)
+            self.generate_speech(transcript, voice="echo", speed=1.0)
+
+    async def _generate_speech_async(self, text, voice="alloy", speed=1.0):
+        try:
+            response = self.client.audio.speech.create(
+                model="tts-1-hd",  # Высококачественная модель
+                voice=voice,
+                input=text,
+                speed=speed
+            )
+            audio_data = response.content  # MP3 данные
+            audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_data))
+            wav_buffer = io.BytesIO()
+            # Экспорт с явной настройкой качества
+            audio_segment.export(wav_buffer, format="wav", parameters=["-ar", "48000", "-ac", "1", "-sample_fmt", "s16"])
+            wav_data = wav_buffer.getvalue()
+            print(f"[SpeechHandler] Generated audio for: {text}")
+            return wav_data
+        except Exception as e:
+            print(f"[SpeechHandler] Speech generation error: {e}")
+            return None
+
+    def generate_speech(self, text, voice="alloy", speed=1.0):
+        self.speech_playback_queue.put((text, voice, speed))
+        if not self.playback_thread or not self.playback_thread.is_alive():
+            self.playback_thread = Thread(target=self._playback_queue)
+            self.playback_thread.daemon = True
+            self.playback_thread.start()
+        print(f"[SpeechHandler] Queued speech generation for: {text}")
+
+    def _playback_queue(self):
+        while not self.stop_playing.is_set():
+            try:
+                text, voice, speed = self.speech_playback_queue.get(timeout=0.1)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                audio_data = loop.run_until_complete(self._generate_speech_async(text, voice, speed))
+                loop.close()
+                if audio_data:
+                    self._play_audio(audio_data)
+                self.speech_playback_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[SpeechHandler] Playback queue error: {e}")
+                self.speech_playback_queue.task_done()
+
+    def _play_audio(self, audio_data):
+        try:
+            self.stop_playing.clear()
+            self.is_playing = True
+            wf = wave.open(io.BytesIO(audio_data), 'rb')
+            self.output_stream = self.audio.open(
+                format=self.audio.get_format_from_width(wf.getsampwidth()),
+                channels=wf.getnchannels(),
+                rate=wf.getframerate(),
+                output=True
+            )
+            chunk_size = 1024
+            data = wf.readframes(chunk_size)
+            print("[SpeechHandler] Playing audio...")
+            while data and not self.stop_playing.is_set():
+                self.output_stream.write(data)
+                data = wf.readframes(chunk_size)
+            print("[SpeechHandler] Audio playback finished")
+        except Exception as e:
+            print(f"[SpeechHandler] Audio playback error: {e}")
+        finally:
+            if self.output_stream:
+                self.output_stream.stop_stream()
+                self.output_stream.close()
+                self.output_stream = None
+            self.is_playing = False
+
+    def get_transcript(self, timeout=None):
+        try:
+            transcript = self.audio_queue.get(timeout=timeout)
+            print(f"[SpeechHandler] Retrieved transcript: {transcript}")
+            return transcript
+        except queue.Empty:
+            print("[SpeechHandler] No transcript available")
+            return None
+
+    def cleanup(self):
+        self.stop_listening()
+        self.interrupt()
+        self.audio.terminate()
+        self.executor.shutdown(wait=False)
+        if self.playback_thread and self.playback_thread.is_alive():
+            self.stop_playing.set()
+            self.playback_thread.join(timeout=1)
+        print("[SpeechHandler] Cleaned up")
+
+
+class DialogueSystem:
+    def __init__(self):
+        self.active = False
+        self.user_input = ""
+        try:
+            pygame.font.init()
+            self.font = pygame.font.Font(None, 24)
+            print("[DialogueSystem] Font loaded successfully")
+        except Exception as e:
+            print("[DialogueSystem] Font loading failed:", e)
+        self.npc_message = ""
+        self.input_active = False
+        self.conversation_history = []
+        
+        self.ui_surface = pygame.Surface(
+            (WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA).convert_alpha()
+        self.ui_texture = glGenTextures(1)
+        self.current_npc = None
+        self.initial_player_pos = None
+        
+        self.speech_handler = SpeechHandler(api_key)
+        self.use_speech = False
+        self.npc_voices = {
+            "HR": {"voice": "nova", "speed": 0.95, "personality": "warm"},
+            "CEO": {"voice": "onyx", "speed": 1.0, "personality": "confident"}
+        }
+        print("[DialogueSystem] Initialized")
+
+    def render_text(self, surface, text, x, y):
+        max_width = WINDOW_WIDTH - 40
+        line_height = 25
+        words = text.split()
+        lines = []
+        current_line = []
+        current_width = 0
+        text_color = (255, 255, 255)
+
+        for word in words:
+            word_surface = self.font.render(word + ' ', True, text_color)
+            word_width = word_surface.get_width()
+            if current_width + word_width <= max_width:
+                current_line.append(word)
+                current_width += word_width
+            else:
+                lines.append(' '.join(current_line))
+                current_line = [word]
+                current_width = word_width
+
+        if current_line:
+            lines.append(' '.join(current_line))
+
+        for i, line in enumerate(lines):
+            text_surface = self.font.render(line, True, text_color)
+            surface.blit(text_surface, (x, y + i * line_height))
+        return len(lines) * line_height
+
+    def start_conversation(self, npc_role="HR", player_pos=None):
+        self.active = True
+        self.input_active = True
+        self.current_npc = npc_role
+        self.initial_player_pos = [player_pos[0], player_pos[1], player_pos[2]] if player_pos else [0, 0.5, 0]
+        print(f"[DialogueSystem] Started conversation with {npc_role}")
+
+        base_prompt = """Interaction Framework:
+            - Maintain consistent personality throughout conversation
+            - Remember previous context within the dialogue
+            - Use natural speech patterns with occasional filler words
+            - Show emotional intelligence in responses
+            - Keep responses concise but meaningful (2-3 sentences)
+            - React appropriately to both positive and negative interactions
+            """
+
+        if npc_role == "HR":
+            system_prompt = f"""{base_prompt}
+                You are Sarah Chen, HR Director at Venture Builder AI. Core traits:
+                - Warm but professional demeanor
+                - Excellent emotional intelligence
+                - Strong ethical boundaries
+                - Protective of confidential information
+                - Quick to offer practical solutions"""
+        else:  # CEO
+            system_prompt = f"""{base_prompt}
+                You are Michael Chen, CEO of Venture Builder AI. Core traits:
+                - Visionary yet approachable
+                - Strategic thinker
+                - Passionate about venture building
+                - Values transparency
+                - Leads by example"""
+
+        initial_message = {
+            "HR": "Hello! I'm Sarah, the HR Director at Venture Builder AI. How can I assist you today?",
+            "CEO": "Hello! I'm Michael, the CEO of Venture Builder AI. What can I do for you today?"
+        }
+
+        self.npc_message = initial_message[npc_role]
+        self.conversation_history = [{"role": "system", "content": system_prompt}]
+        
+        if self.use_speech:
+            self.speech_handler.start_listening()
+            npc_voice_config = self.npc_voices.get(npc_role, {"voice": "alloy", "speed": 1.0})
+            self.speech_handler.generate_speech(
+                self.npc_message,
+                voice=npc_voice_config["voice"],
+                speed=npc_voice_config["speed"]
+            )
+
+    def send_message(self):
+        if not self.conversation_history:
+            print("[DialogueSystem] No conversation history")
+            return
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4-0125-preview",
+                messages=self.conversation_history,
+                temperature=0.85,
+                max_tokens=150,
+                response_format={"type": "text"}
+            )
+            ai_message = response.choices[0].message.content
+            self.conversation_history.append({"role": "assistant", "content": ai_message})
+            self.npc_message = ai_message
+            
+            if self.use_speech:
+                npc_voice_config = self.npc_voices.get(self.current_npc, {"voice": "alloy", "speed": 1.0})
+                self.speech_handler.generate_speech(
+                    ai_message,
+                    voice=npc_voice_config["voice"],
+                    speed=npc_voice_config["speed"]
+                )
+            print(f"[DialogueSystem] NPC says: {self.npc_message}")
+        except Exception as e:
+            self.npc_message = "Sorry, I'm having some technical difficulties."
+            print(f"[DialogueSystem] Error: {e}")
+
+    def render(self):
+        if not self.active:
+            if self.use_speech:
+                transcript = self.speech_handler.get_transcript(timeout=0.1)
+                if transcript and not self.active:
+                    print(f"[DialogueSystem] Speech detected outside dialogue: {transcript}")
+                    self.speech_handler.generate_speech(transcript, voice="echo", speed=1.0)
+            return
+
+        self.ui_surface.fill((0, 0, 0, 0))
+        box_height = 200
+        box_y = WINDOW_HEIGHT - box_height - 20
+
+        box_color = (0, 0, 0, 230)
+        pygame.draw.rect(self.ui_surface, box_color,
+                         (20, box_y, WINDOW_WIDTH - 40, box_height))
+        pygame.draw.rect(self.ui_surface, (255, 255, 255, 255),
+                         (20, box_y, WINDOW_WIDTH - 40, box_height), 2)
+
+        quit_text_surface = self.font.render(
+            "Press Shift+Q to exit", True, (255, 255, 255))
+        self.ui_surface.blit(quit_text_surface, (40, box_y + 10))
+
+        if self.npc_message:
+            self.render_text(self.ui_surface, self.npc_message, 40, box_y + 40)
+
+        if self.input_active:
+            input_prompt = "> " + self.user_input + "_"
+            input_surface = self.font.render(input_prompt, True, (255, 255, 255))
+            self.ui_surface.blit(input_surface, (40, box_y + box_height - 40))
+
+        texture_data = pygame.image.tostring(self.ui_surface, "RGBA", True)
+        glPushAttrib(GL_ALL_ATTRIB_BITS)
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, WINDOW_WIDTH, 0, WINDOW_HEIGHT, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, self.ui_texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WINDOW_WIDTH,
+                     WINDOW_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 0)
+        glVertex2f(0, 0)
+        glTexCoord2f(1, 0)
+        glVertex2f(WINDOW_WIDTH, 0)
+        glTexCoord2f(1, 1)
+        glVertex2f(WINDOW_WIDTH, WINDOW_HEIGHT)
+        glTexCoord2f(0, 1)
+        glVertex2f(0, WINDOW_HEIGHT)
+        glEnd()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+        glPopAttrib()
+
+        if self.use_speech and self.input_active:
+            transcript = self.speech_handler.get_transcript(timeout=0.1)
+            if transcript:
+                self.speech_handler.interrupt()
+                print(f"[DialogueSystem] User said (via speech): {transcript}")
+                self.conversation_history.append({"role": "user", "content": transcript.strip()})
+                self.user_input = transcript
+                self.send_message()
+                self.user_input = ""
+
+    def handle_input(self, event):
+        print(f"[DialogueSystem] Handling input event: {event}")
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_v:
+            self.use_speech = not self.use_speech
+            if self.use_speech:
+                print("[DialogueSystem] Speech mode activated")
+                self.speech_handler.start_listening()
+            else:
+                print("[DialogueSystem] Speech mode deactivated")
+                self.speech_handler.stop_listening()
+            return None
+
+        if not self.active:
+            return None
+
+        if event.type == pygame.KEYDOWN:
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_LSHIFT] and event.key == pygame.K_q:
+                self.active = False
+                self.input_active = False
+                if self.use_speech:
+                    self.speech_handler.stop_listening()
+                print("[DialogueSystem] Chat ended")
+                return {"command": "move_player_back", "position": self.initial_player_pos}
+
+            if event.key == pygame.K_RETURN:
+                self.speech_handler.interrupt()  # Прерываем текущее воспроизведение перед новым вводом
+                if self.user_input.strip():
+                    print(f"[DialogueSystem] User said: {self.user_input}")
+                    self.conversation_history.append({"role": "user", "content": self.user_input.strip()})
+                    if self.use_speech:
+                        self.speech_handler.generate_speech(self.user_input, voice="echo", speed=1.0)
+                    self.user_input = ""
+                    self.send_message()
+            elif event.key == pygame.K_BACKSPACE:
+                self.user_input = self.user_input[:-1]
+            elif event.unicode.isprintable():
+                self.user_input += event.unicode
+        return None
+
+
+class World:
+    def __init__(self):
+        self.size = 5
+        self.colors = {
+            'floor': (0.76, 0.6, 0.42),
+            'walls': (0.85, 0.85, 0.85),
+            'desk': (0.6, 0.4, 0.2),
+            'chair': (0.2, 0.2, 0.2),
+            'computer': (0.1, 0.1, 0.1),
+            'plant': (0.2, 0.5, 0.2),
+            'partition': (0.3, 0.3, 0.3)
+        }
+
+    def draw_desk(self, x, z, rotation=0):
+        glPushMatrix()
+        glTranslatef(x, 0, z)
+        glRotatef(rotation, 0, 1, 0)
+        glColor3f(*self.colors['desk'])
+        glBegin(GL_QUADS)
+        glVertex3f(-0.4, 0.4, -0.3)
+        glVertex3f(0.4, 0.4, -0.3)
+        glVertex3f(0.4, 0.4, 0.3)
+        glVertex3f(-0.4, 0.4, 0.3)
+        glEnd()
+        for x_offset, z_offset in [(-0.35, -0.25), (0.35, -0.25), (-0.35, 0.25), (0.35, 0.25)]:
+            glBegin(GL_QUADS)
+            glVertex3f(x_offset-0.02, 0, z_offset-0.02)
+            glVertex3f(x_offset+0.02, 0, z_offset-0.02)
+            glVertex3f(x_offset+0.02, 0.4, z_offset-0.02)
+            glVertex3f(x_offset-0.02, 0.4, z_offset-0.02)
+            glEnd()
+        glColor3f(*self.colors['computer'])
+        glTranslatef(-0.15, 0.4, 0)
+        glBegin(GL_QUADS)
+        glVertex3f(-0.1, 0, -0.05)
+        glVertex3f(0.1, 0, -0.05)
+        glVertex3f(0.1, 0.2, -0.05)
+        glVertex3f(-0.1, 0.2, -0.05)
+        glEnd()
+        glPopMatrix()
+
+    def draw_chair(self, x, z, rotation=0):
+        glPushMatrix()
+        glTranslatef(x, 0, z)
+        glRotatef(rotation, 0, 1, 0)
+        glColor3f(*self.colors['chair'])
+        glBegin(GL_QUADS)
+        glVertex3f(-0.15, 0.25, -0.15)
+        glVertex3f(0.15, 0.25, -0.15)
+        glVertex3f(0.15, 0.25, 0.15)
+        glVertex3f(-0.15, 0.25, 0.15)
+        glEnd()
+        glBegin(GL_QUADS)
+        glVertex3f(-0.15, 0.25, -0.15)
+        glVertex3f(0.15, 0.25, -0.15)
+        glVertex3f(0.15, 0.5, -0.15)
+        glVertex3f(-0.15, 0.5, -0.15)
+        glEnd()
+        for x_offset, z_offset in [(-0.12, -0.12), (0.12, -0.12), (-0.12, 0.12), (0.12, 0.12)]:
+            glBegin(GL_QUADS)
+            glVertex3f(x_offset-0.02, 0, z_offset-0.02)
+            glVertex3f(x_offset+0.02, 0, z_offset-0.02)
+            glVertex3f(x_offset+0.02, 0.25, z_offset-0.02)
+            glVertex3f(x_offset-0.02, 0.25, z_offset-0.02)
+            glEnd()
+        glPopMatrix()
+
+    def draw_plant(self, x, z):
+        glPushMatrix()
+        glTranslatef(x, 0, z)
+        glColor3f(0.4, 0.2, 0.1)
+        pot_radius = 0.1
+        pot_height = 0.15
+        segments = 8
+        glBegin(GL_QUADS)
+        for i in range(segments):
+            angle1 = (i / segments) * 2 * math.pi
+            angle2 = ((i + 1) / segments) * 2 * math.pi
+            x1 = math.cos(angle1) * pot_radius
+            z1 = math.sin(angle1) * pot_radius
+            x2 = math.cos(angle2) * pot_radius
+            z2 = math.sin(angle2) * pot_radius
+            glVertex3f(x1, 0, z1)
+            glVertex3f(x2, 0, z2)
+            glVertex3f(x2, pot_height, z2)
+            glVertex3f(x1, pot_height, z1)
+        glEnd()
+        glColor3f(*self.colors['plant'])
+        glTranslatef(0, pot_height, 0)
+        leaf_size = 0.15
+        num_leaves = 6
+        for i in range(num_leaves):
+            angle = (i / num_leaves) * 2 * math.pi
+            x = math.cos(angle) * leaf_size
+            z = math.sin(angle) * leaf_size
+            glBegin(GL_TRIANGLES)
+            glVertex3f(0, 0, 0)
+            glVertex3f(x, leaf_size, z)
+            glVertex3f(z, leaf_size/2, -x)
+            glEnd()
+        glPopMatrix()
+
+    def draw(self):
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+        glBegin(GL_QUADS)
+        glColor3f(*self.colors['floor'])
+        glNormal3f(0, 1, 0)
+        glVertex3f(-self.size, 0, -self.size)
+        glVertex3f(-self.size, 0, self.size)
+        glVertex3f(self.size, 0, self.size)
+        glVertex3f(self.size, 0, -self.size)
+        glEnd()
+        glBegin(GL_QUADS)
+        glColor3f(*self.colors['walls'])
+        glVertex3f(-self.size, 0, -self.size)
+        glVertex3f(self.size, 0, -self.size)
+        glVertex3f(self.size, 2, -self.size)
+        glVertex3f(-self.size, 2, -self.size)
+        glVertex3f(-self.size, 0, self.size)
+        glVertex3f(self.size, 0, self.size)
+        glVertex3f(self.size, 2, self.size)
+        glVertex3f(-self.size, 2, self.size)
+        glVertex3f(-self.size, 0, -self.size)
+        glVertex3f(-self.size, 0, self.size)
+        glVertex3f(-self.size, 2, self.size)
+        glVertex3f(-self.size, 2, -self.size)
+        glVertex3f(self.size, 0, -self.size)
+        glVertex3f(self.size, 0, self.size)
+        glVertex3f(self.size, 2, self.size)
+        glVertex3f(self.size, 2, -self.size)
+        glEnd()
+        self.draw_desk(-4, -2, 90)
+        self.draw_chair(-3.5, -2, 90)
+        self.draw_desk(4, 1, -90)
+        self.draw_chair(3.5, 1, -90)
+        self.draw_plant(-4.5, -4.5)
+        self.draw_plant(4.5, -4.5)
+        self.draw_plant(-4.5, 4.5)
+        self.draw_plant(4.5, 4.5)
+
+    def draw_partition_walls(self, x, z):
+        glColor3f(0.3, 0.3, 0.3)
+        glPushMatrix()
+        glTranslatef(x, 0, z)
+        glScalef(0.05, 1.0, 1.0)
+        draw_cube()
+        glPopMatrix()
+        glPushMatrix()
+        glTranslatef(x, 0, z + 0.5)
+        glRotatef(90, 0, 1, 0)
+        glScalef(0.05, 1.0, 0.8)
+        draw_cube()
+        glPopMatrix()
+
+
+
+class Player:
+    def __init__(self):
+        self.pos = [0, 0.5, 0]
+        self.rot = [0, 0, 0]
+        self.speed = 0.3
+        self.mouse_sensitivity = 0.5
+
+    def move(self, dx, dz):
+        angle = math.radians(-self.rot[1])
+        move_x = (dx * math.cos(angle) + dz * math.sin(angle)) * self.speed
+        move_z = (-dx * math.sin(angle) + dz * math.cos(angle)) * self.speed
+        new_x = self.pos[0] + move_x
+        new_z = self.pos[2] + move_z
+        room_limit = 4.5
+        if abs(new_x) < room_limit:
+            self.pos[0] = new_x
+        if abs(new_z) < room_limit:
+            self.pos[2] = new_z
+
+    def update_rotation(self, dx, dy):
+        self.rot[1] += dx * self.mouse_sensitivity
+
+
+
+class NPC:
+    def __init__(self, x, y, z, role="HR"):
+        self.scale = 0.6
+        self.pos = [x, 0.65, z]
+        self.size = 0.5
+        self.role = role
+        self.skin_color = (0.8, 0.7, 0.6)
+        self.hair_color = (0.2, 0.15, 0.1) if role == "HR" else (0.3, 0.3, 0.3)
+        self.clothes_primary = (0.8, 0.2, 0.2) if role == "HR" else (0.2, 0.3, 0.8)
+        self.clothes_secondary = (0.6, 0.15, 0.15) if role == "HR" else (0.15, 0.2, 0.6)
+
+    def draw(self):
+        glPushMatrix()
+        glTranslatef(self.pos[0], self.pos[1], self.pos[2])
+        glScalef(self.scale, self.scale, self.scale)
+        glColor3f(*self.skin_color)
+        draw_sphere(0.12, 16, 16)
+        glColor3f(*self.hair_color)
+        glPushMatrix()
+        glTranslatef(0, 0.05, 0)
+        draw_sphere(0.13, 16, 16)
+        glPopMatrix()
+        glColor3f(*self.clothes_primary)
+        glPushMatrix()
+        glTranslatef(0, -0.3, 0)
+        glScalef(0.3, 0.4, 0.2)
+        draw_cube()
+        glPopMatrix()
+        glColor3f(*self.clothes_secondary)
+        for x_offset in [-0.2, 0.2]:
+            glPushMatrix()
+            glTranslatef(x_offset, -0.3, 0)
+            glScalef(0.1, 0.4, 0.1)
+            draw_cube()
+            glPopMatrix()
+        for x_offset in [-0.1, 0.1]:
+            glPushMatrix()
+            glTranslatef(x_offset, -0.8, 0)
+            glScalef(0.1, 0.5, 0.1)
+            draw_cube()
+            glPopMatrix()
+        glPopMatrix()
+
+
+
+class MenuScreen:
+    def __init__(self):
+        self.font_large = pygame.font.Font(None, 74)
+        self.font_medium = pygame.font.Font(None, 48)
+        self.font_small = pygame.font.Font(None, 36)
+        self.active = True
+        self.start_time = time.time()
+
+    def render(self):
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        center_y = WINDOW_HEIGHT // 2
+        title_y = center_y - 100
+        subtitle_y = center_y - 20
+        prompt_y = center_y + 100
+        elapsed_time = time.time() - self.start_time
+        title_chars = int(min(len(TITLE), elapsed_time * 15))
+        partial_title = TITLE[:title_chars]
+        title_surface = self.font_large.render(partial_title, True, MENU_TEXT_COLOR)
+        title_x = (WINDOW_WIDTH - title_surface.get_width()) // 2
+        surface.blit(title_surface, (title_x, title_y))
+        if elapsed_time > len(TITLE) / 15:
+            subtitle_alpha = min(255, int((elapsed_time - len(TITLE) / 15) * 255))
+            subtitle_surface = self.font_medium.render(SUBTITLE, True, MENU_TEXT_COLOR)
+            subtitle_surface.set_alpha(subtitle_alpha)
+            subtitle_x = (WINDOW_WIDTH - subtitle_surface.get_width()) // 2
+            surface.blit(subtitle_surface, (subtitle_x, subtitle_y))
+        if elapsed_time > (len(TITLE) / 15 + 1):
+            if int(elapsed_time * 2) % 2:
+                prompt_text = "Press ENTER to start"
+                prompt_surface = self.font_small.render(prompt_text, True, MENU_TEXT_COLOR)
+                prompt_x = (WINDOW_WIDTH - prompt_surface.get_width()) // 2
+                surface.blit(prompt_surface, (prompt_x, prompt_y))
+        for y in range(0, WINDOW_HEIGHT, 4):
+            pygame.draw.line(surface, (0, 50, 0), (0, y), (WINDOW_WIDTH, y))
+        texture_data = pygame.image.tostring(surface, "RGBA", True)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, WINDOW_WIDTH, WINDOW_HEIGHT, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glEnable(GL_TEXTURE_2D)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 1)
+        glVertex2f(0, 0)
+        glTexCoord2f(1, 1)
+        glVertex2f(WINDOW_WIDTH, 0)
+        glTexCoord2f(1, 0)
+        glVertex2f(WINDOW_WIDTH, WINDOW_HEIGHT)
+        glTexCoord2f(0, 0)
+        glVertex2f(0, WINDOW_HEIGHT)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(45, (WINDOW_WIDTH / WINDOW_HEIGHT), 0.1, 50.0)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glEnable(GL_DEPTH_TEST)
+        pygame.display.flip()
+
+
+
+class Game3D:
+    def __init__(self):
+        self.menu = MenuScreen()
+        self.player = Player()
+        self.world = World()
+        self.dialogue = DialogueSystem()
+        self.hr_npc = NPC(-3.3, 0, -2, "HR")
+        self.ceo_npc = NPC(3.3, 0, 1, "CEO")
+        self.interaction_distance = 2.0
+        self.last_interaction_time = 0
+        self.move_forward = False
+        self.move_backward = False
+        self.move_left = False
+        self.move_right = False
+        print("[Game3D] Initialized successfully")
+
+    def move_player_away_from_npc(self, npc_pos):
+        dx = self.player.pos[0] - npc_pos[0]
+        dz = self.player.pos[2] - npc_pos[2]
+        distance = math.sqrt(dx*dx + dz*dz)
+        if distance > 0:
+            dx /= distance
+            dz /= distance
+        self.player.pos[0] = npc_pos[0] + (dx * 3)
+        self.player.pos[2] = npc_pos[2] + (dz * 3)
+        print(f"[Game3D] Player moved away from NPC to {self.player.pos}")
+
+    def run(self):
+        running = True
+        print("[Game3D] Starting game loop")
+        while running:
+            print(f"[Game3D] Loop running, dialogue active: {self.dialogue.active}, player pos: {self.player.pos}")
+            if self.menu.active:
+                print("[Game3D] Menu is active")
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                        print("[Game3D] Quit event received")
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_RETURN and time.time() - self.menu.start_time > (len(TITLE) / 15 + 1):
+                            self.menu.active = False
+                            pygame.mouse.set_visible(False)
+                            pygame.event.set_grab(True)
+                            print("[Game3D] Menu closed, entering game mode")
+                        elif event.key == pygame.K_ESCAPE:
+                            running = False
+                            print("[Game3D] Escape pressed, exiting")
+                self.menu.render()
+            else:
+                events = pygame.event.get()
+                if not events:
+                    print("[Game3D] No events this frame")
+                for event in events:
+                    print(f"[Game3D] Processing event: {event}")
+                    if event.type == pygame.QUIT:
+                        running = False
+                        print("[Game3D] Quit event received")
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_ESCAPE:
+                            pygame.mouse.set_visible(True)
+                            pygame.event.set_grab(False)
+                            running = False
+                            print("[Game3D] Escape pressed, exiting")
+                        elif event.scancode == 26:
+                            self.move_forward = True
+                            print("[Game3D] Move forward started")
+                        elif event.scancode == 22:
+                            self.move_backward = True
+                            print("[Game3D] Move backward started")
+                        elif event.scancode == 4:
+                            self.move_left = True
+                            print("[Game3D] Move left started")
+                        elif event.scancode == 7:
+                            self.move_right = True
+                            print("[Game3D] Move right started")
+                        result = self.dialogue.handle_input(event)
+                        if isinstance(result, dict) and result.get("command") == "move_player_back":
+                            current_npc = self.hr_npc if self.dialogue.current_npc == "HR" else self.ceo_npc
+                            self.move_player_away_from_npc(current_npc.pos)
+                            print(f"[Game3D] Dialogue ended, player moved to {self.player.pos}, dialogue active: {self.dialogue.active}")
+                    elif event.type == pygame.KEYUP:
+                        if event.scancode == 26:
+                            self.move_forward = False
+                            print("[Game3D] Move forward stopped")
+                        elif event.scancode == 22:
+                            self.move_backward = False
+                            print("[Game3D] Move backward stopped")
+                        elif event.scancode == 4:
+                            self.move_left = False
+                            print("[Game3D] Move left stopped")
+                        elif event.scancode == 7:
+                            self.move_right = False
+                            print("[Game3D] Move right stopped")
+                    elif event.type == pygame.MOUSEMOTION:
+                        x, y = event.rel
+                        self.player.update_rotation(x, y)
+                        print(f"[Game3D] Mouse moved, rotation: {self.player.rot}")
+                moved = False
+                if not self.dialogue.active:
+                    if self.move_forward:
+                        self.player.move(0, -1)
+                        moved = True
+                    if self.move_backward:
+                        self.player.move(0, 1)
+                        moved = True
+                    if self.move_left:
+                        self.player.move(-1, 0)
+                        moved = True
+                    if self.move_right:
+                        self.player.move(1, 0)
+                        moved = True
+                    if moved:
+                        print(f"[Game3D] Player moved to position: {self.player.pos}")
+                current_time = time.time()
+                if current_time - self.last_interaction_time > 0.5:
+                    dx = self.player.pos[0] - self.hr_npc.pos[0]
+                    dz = self.player.pos[2] - self.hr_npc.pos[2]
+                    hr_distance = math.sqrt(dx*dx + dz*dz)
+                    dx = self.player.pos[0] - self.ceo_npc.pos[0]
+                    dz = self.player.pos[2] - self.ceo_npc.pos[2]
+                    ceo_distance = math.sqrt(dx*dx + dz*dz)
+                    if hr_distance < self.interaction_distance and not self.dialogue.active:
+                        self.dialogue.start_conversation("HR", self.player.pos)
+                        self.last_interaction_time = current_time
+                        print(f"[Game3D] Started conversation with HR at distance {hr_distance}")
+                    elif ceo_distance < self.interaction_distance and not self.dialogue.active:
+                        self.dialogue.start_conversation("CEO", self.player.pos)
+                        self.last_interaction_time = current_time
+                        print(f"[Game3D] Started conversation with CEO at distance {ceo_distance}")
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                glPushMatrix()
+                glRotatef(self.player.rot[0], 1, 0, 0)
+                glRotatef(self.player.rot[1], 0, 1, 0)
+                glTranslatef(-self.player.pos[0], -self.player.pos[1], -self.player.pos[2])
+                self.world.draw()
+                self.hr_npc.draw()
+                self.ceo_npc.draw()
+                glPopMatrix()
+                self.dialogue.render()
+                pygame.display.flip()
+                pygame.time.Clock().tick(60)
+        print("[Game3D] Game loop ended")
+        shutdown()
+        pygame.quit()
+
+
+
+game = Game3D()
+game.run()
